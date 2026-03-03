@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "django-ipgeo"
+version = "0.1.0"
+description = "Parallel IP geolocation for Django - 5 free services, majority voting, zero external dependencies"
+requires-python = ">=3.10"
+dependencies = [
+    "django>=4.2",
+]
+license = {text = "MIT"}
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff"]
