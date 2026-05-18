@@ -1,15 +1,14 @@
 """
-Parallel IP geolocation engine.
+IP geolocation engine.
 
-Queries 5 free services simultaneously, returns majority-voted city.
-No external dependencies — uses only Python standard library.
+Priority order:
+  1. Local MaxMind GeoLite2 DB (if LOCAL_DB_PATH is configured) — no network call.
+  2. Remote APIs queried sequentially; returns on first success.
 """
 
 import ipaddress
 import json
 import logging
-from collections import Counter
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
@@ -144,50 +143,70 @@ GEO_SERVICES = [
 
 
 # ---------------------------------------------------------------------------
-# Main function — parallel execution with majority voting
+# Local DB adapter (MaxMind GeoLite2-City via geoip2 library)
+# ---------------------------------------------------------------------------
+
+def _query_local_db(ip):
+    """
+    Query a local MaxMind GeoLite2-City .mmdb file.
+    Requires: pip install geoip2
+    Configured via IPGEO["LOCAL_DB_PATH"] in Django settings.
+    Returns a geo dict or None.
+    """
+    from .conf import get as get_conf
+    db_path = get_conf("LOCAL_DB_PATH")
+    if not db_path:
+        return None
+    try:
+        import geoip2.database  # optional dependency
+        with geoip2.database.Reader(db_path) as reader:
+            resp = reader.city(ip)
+            city = resp.city.name
+            if not city:
+                return None
+            return {
+                "city": city,
+                "country": resp.country.name,
+                "country_code": resp.country.iso_code,
+                "lat": resp.location.latitude,
+                "lon": resp.location.longitude,
+            }
+    except Exception as exc:
+        logger.debug("ipgeo local DB failed for %s: %s", ip, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Main function — local DB first, then sequential remote fallback
 # ---------------------------------------------------------------------------
 
 def geolocate_ip(ip, timeout=2, user_agent="django-ipgeo/1.0"):
     """
-    Query all geolocation services in parallel, aggregate by majority vote.
+    Locate an IP address.
+
+    1. Try the local MaxMind DB (no network). If it returns a result, done.
+    2. Query remote services one-by-one and return on the first success.
 
     Returns dict with keys:
         city, country, country_code, lat, lon, confidence, sources
-    or None if no service returned a result.
+    or None if nothing worked.
     """
-    results = []
+    # --- 1. Local DB ---
+    result = _query_local_db(ip)
+    if result:
+        logger.debug("ipgeo: local DB hit for %s -> %s", ip, result["city"])
+        return {**result, "confidence": 1.0, "sources": 1}
 
-    with ThreadPoolExecutor(max_workers=len(GEO_SERVICES)) as executor:
-        futures = {
-            executor.submit(fn, ip, timeout, user_agent): fn.__name__
-            for fn in GEO_SERVICES
-        }
-        for future in as_completed(futures, timeout=timeout + 1):
-            name = futures[future]
-            try:
-                result = future.result(timeout=0.1)
-                if result:
-                    results.append(result)
-                    logger.debug("ipgeo service %s returned: %s", name, result["city"])
-            except Exception as exc:
-                logger.debug("ipgeo service %s failed: %s", name, exc)
+    # --- 2. Remote APIs, sequential, stop at first success ---
+    for fn in GEO_SERVICES:
+        try:
+            result = fn(ip, timeout, user_agent)
+        except Exception as exc:
+            logger.debug("ipgeo service %s raised: %s", fn.__name__, exc)
+            continue
+        if result:
+            logger.debug("ipgeo service %s hit for %s -> %s", fn.__name__, ip, result["city"])
+            return {**result, "confidence": 1.0, "sources": 1}
+        logger.debug("ipgeo service %s returned nothing for %s", fn.__name__, ip)
 
-    if not results:
-        return None
-
-    # Majority vote on city name (case-insensitive)
-    city_counter = Counter(r["city"].lower() for r in results)
-    best_city_lower, vote_count = city_counter.most_common(1)[0]
-
-    # Pick the first result matching the winning city for full data
-    winning = next(r for r in results if r["city"].lower() == best_city_lower)
-
-    return {
-        "city": winning["city"],
-        "country": winning["country"],
-        "country_code": winning["country_code"],
-        "lat": winning["lat"],
-        "lon": winning["lon"],
-        "confidence": round(vote_count / len(results), 2),
-        "sources": len(results),
-    }
+    return None

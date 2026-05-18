@@ -4,6 +4,9 @@ _DEFAULTS = {
     # Engine settings
     "TIMEOUT": 2,
     "SESSION_KEY": "ipgeo",
+    # Path to a local MaxMind GeoLite2-City (.mmdb) database file.
+    # If set and the DB returns a result, no remote API calls are made.
+    "LOCAL_DB_PATH": None,
 
     # Country model matching (set to None to disable)
     "COUNTRY_MODEL": None,
