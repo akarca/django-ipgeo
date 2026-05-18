@@ -4,11 +4,20 @@ IP geolocation engine.
 Priority order:
   1. Local MaxMind GeoLite2 DB (if LOCAL_DB_PATH is configured) — no network call.
   2. Remote APIs queried sequentially; returns on first success.
+
+Auto-download: if LOCAL_DB_LICENSE_KEY is set and the DB file is missing or
+older than LOCAL_DB_UPDATE_DAYS days, a background thread downloads it from
+MaxMind. While the download is in progress the engine falls through to remote
+APIs transparently.
 """
 
 import ipaddress
 import json
 import logging
+import os
+import tarfile
+import threading
+import time
 from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
@@ -143,19 +152,105 @@ GEO_SERVICES = [
 
 
 # ---------------------------------------------------------------------------
-# Local DB adapter (MaxMind GeoLite2-City via geoip2 library)
+# Local DB — auto-download + query
 # ---------------------------------------------------------------------------
+
+_download_lock = threading.Lock()
+_download_in_progress = False
+
+
+def _db_needs_update(db_path, update_days):
+    """Return True if db_path doesn't exist or is older than update_days."""
+    if not os.path.exists(db_path):
+        return True
+    age_seconds = time.time() - os.path.getmtime(db_path)
+    return age_seconds > update_days * 86400
+
+
+def _download_db(db_path, license_key, edition):
+    """
+    Download a MaxMind GeoLite2 .mmdb and atomically replace db_path.
+    Runs in a background thread — never raises, only logs.
+    """
+    global _download_in_progress
+    url = (
+        f"https://download.maxmind.com/app/geoip_download"
+        f"?edition_id={edition}&license_key={license_key}&suffix=tar.gz"
+    )
+    tmp_tar = db_path + ".download.tar.gz"
+    tmp_mmdb = db_path + ".download.mmdb"
+    try:
+        logger.info("ipgeo: downloading %s from MaxMind...", edition)
+        req = Request(url, headers={"User-Agent": "django-ipgeo/1.0"})
+        with urlopen(req, timeout=120) as resp, open(tmp_tar, "wb") as fh:
+            while chunk := resp.read(65536):
+                fh.write(chunk)
+
+        with tarfile.open(tmp_tar, "r:gz") as tf:
+            mmdb_member = next(
+                m for m in tf.getmembers() if m.name.endswith(".mmdb")
+            )
+            with tf.extractfile(mmdb_member) as src, open(tmp_mmdb, "wb") as dst:
+                dst.write(src.read())
+
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        os.replace(tmp_mmdb, db_path)
+        logger.info("ipgeo: %s updated at %s", edition, db_path)
+    except Exception as exc:
+        logger.error("ipgeo: failed to download %s: %s", edition, exc)
+    finally:
+        for f in (tmp_tar, tmp_mmdb):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        with _download_lock:
+            _download_in_progress = False
+
+
+def maybe_schedule_db_update():
+    """
+    Called at app startup. If the DB is missing or stale and a license key is
+    configured, spawn a background thread to download it.
+    """
+    global _download_in_progress
+    from .conf import get as get_conf
+
+    db_path = get_conf("LOCAL_DB_PATH")
+    license_key = get_conf("LOCAL_DB_LICENSE_KEY")
+    if not db_path or not license_key:
+        return
+
+    update_days = get_conf("LOCAL_DB_UPDATE_DAYS")
+    if not _db_needs_update(db_path, update_days):
+        return
+
+    with _download_lock:
+        if _download_in_progress:
+            return
+        _download_in_progress = True
+
+    edition = get_conf("LOCAL_DB_EDITION")
+    t = threading.Thread(
+        target=_download_db,
+        args=(db_path, license_key, edition),
+        daemon=True,
+        name="ipgeo-db-download",
+    )
+    t.start()
+    logger.info("ipgeo: started background DB download (thread: %s)", t.name)
+
 
 def _query_local_db(ip):
     """
-    Query a local MaxMind GeoLite2-City .mmdb file.
+    Query the local MaxMind .mmdb file.
     Requires: pip install geoip2
-    Configured via IPGEO["LOCAL_DB_PATH"] in Django settings.
-    Returns a geo dict or None.
+    Returns a geo dict or None (also returns None while a download is in progress).
     """
     from .conf import get as get_conf
     db_path = get_conf("LOCAL_DB_PATH")
-    if not db_path:
+    if not db_path or not os.path.exists(db_path):
+        # File missing: either first-time download in progress or no DB configured.
         return None
     try:
         import geoip2.database  # optional dependency

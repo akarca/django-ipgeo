@@ -4,9 +4,15 @@ _DEFAULTS = {
     # Engine settings
     "TIMEOUT": 2,
     "SESSION_KEY": "ipgeo",
-    # Path to a local MaxMind GeoLite2-City (.mmdb) database file.
-    # If set and the DB returns a result, no remote API calls are made.
+    # Path where the local MaxMind .mmdb file lives (or will be downloaded to).
     "LOCAL_DB_PATH": None,
+    # MaxMind license key — if set, the DB is downloaded automatically when
+    # missing or older than LOCAL_DB_UPDATE_DAYS days.
+    "LOCAL_DB_LICENSE_KEY": None,
+    # MaxMind edition to download (default: GeoLite2-City).
+    "LOCAL_DB_EDITION": "GeoLite2-City",
+    # Re-download the local DB after this many days.
+    "LOCAL_DB_UPDATE_DAYS": 60,
 
     # Country model matching (set to None to disable)
     "COUNTRY_MODEL": None,
