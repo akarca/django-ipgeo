@@ -9,6 +9,11 @@ Auto-download: if LOCAL_DB_LICENSE_KEY is set and the DB file is missing or
 older than LOCAL_DB_UPDATE_DAYS days, a background thread downloads it from
 MaxMind. While the download is in progress the engine falls through to remote
 APIs transparently.
+
+Cache: download first tries a public mirror (default: ipaddress.world's
+/api/geoip-cache/<edition>/) to avoid MaxMind's daily download limit. On
+cache miss it falls through to MaxMind, then re-uploads the fresh file to
+the cache so the next consumer benefits.
 """
 
 import ipaddress
@@ -18,6 +23,7 @@ import os
 import tarfile
 import threading
 import time
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
@@ -167,24 +173,100 @@ def _db_needs_update(db_path, update_days):
     return age_seconds > update_days * 86400
 
 
+def _http_download(url, dest_path, timeout=120):
+    """Stream url -> dest_path. Returns True on success."""
+    req = Request(url, headers={"User-Agent": "django-ipgeo/1.0"})
+    with urlopen(req, timeout=timeout) as resp, open(dest_path, "wb") as fh:
+        while chunk := resp.read(65536):
+            fh.write(chunk)
+    return True
+
+
+def _fetch_from_cache(cache_url_template, edition, dest_path):
+    """Try the public mirror first. Returns True if a fresh .mmdb was written."""
+    if not cache_url_template:
+        return False
+    cache_url = cache_url_template.format(edition=edition)
+    try:
+        logger.info("ipgeo: trying cache %s", cache_url)
+        tmp = dest_path + ".cache.mmdb"
+        _http_download(cache_url, tmp)
+        # Sanity-check: real MaxMind mmdb starts with the binary database type
+        # marker (0x00 0x01 0x02 0x03 in big-endian). Anything else is almost
+        # certainly an HTML error page cached at the edge.
+        with open(tmp, "rb") as fh:
+            header = fh.read(4)
+        if header != b"\x00\x01\x02\x03":
+            logger.warning("ipgeo: cache returned non-mmdb payload (header=%r)", header)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return False
+        os.replace(tmp, dest_path)
+        logger.info("ipgeo: cache hit for %s at %s", edition, dest_path)
+        return True
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        logger.info("ipgeo: cache miss for %s (%s)", edition, exc)
+        try:
+            os.remove(dest_path + ".cache.mmdb")
+        except OSError:
+            pass
+        return False
+
+
+def _upload_to_cache(cache_url_template, upload_token, edition, source_path):
+    """Best-effort upload of source_path to the public cache."""
+    if not cache_url_template or not upload_token:
+        return
+    cache_url = cache_url_template.format(edition=edition)
+    try:
+        with open(source_path, "rb") as fh:
+            req = Request(
+                cache_url,
+                data=fh.read(),
+                method="PUT",
+                headers={
+                    "User-Agent": "django-ipgeo/1.0",
+                    "X-GeoIP-Token": upload_token,
+                    "Content-Type": "application/octet-stream",
+                },
+            )
+            urlopen(req, timeout=120).read()
+        logger.info("ipgeo: uploaded %s to cache", edition)
+    except Exception as exc:
+        logger.warning("ipgeo: cache upload failed for %s: %s", edition, exc)
+
+
 def _download_db(db_path, license_key, edition):
     """
     Download a MaxMind GeoLite2 .mmdb and atomically replace db_path.
     Runs in a background thread — never raises, only logs.
     """
     global _download_in_progress
-    url = (
-        f"https://download.maxmind.com/app/geoip_download"
-        f"?edition_id={edition}&license_key={license_key}&suffix=tar.gz"
-    )
+    from .conf import get as get_conf
+
+    cache_url = get_conf("CACHE_URL")
+    upload_token = get_conf("CACHE_UPLOAD_TOKEN")
+
     tmp_tar = db_path + ".download.tar.gz"
     tmp_mmdb = db_path + ".download.mmdb"
     try:
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+
+        # --- 1. Cache first ---
+        if _fetch_from_cache(cache_url, edition, tmp_mmdb):
+            os.replace(tmp_mmdb, db_path)
+            logger.info("ipgeo: %s updated from cache at %s", edition, db_path)
+            return
+
+        # --- 2. MaxMind ---
+        url = (
+            f"https://download.maxmind.com/app/geoip_download"
+            f"?edition_id={edition}&license_key={license_key}&suffix=tar.gz"
+        )
         logger.info("ipgeo: downloading %s from MaxMind...", edition)
-        req = Request(url, headers={"User-Agent": "django-ipgeo/1.0"})
-        with urlopen(req, timeout=120) as resp, open(tmp_tar, "wb") as fh:
-            while chunk := resp.read(65536):
-                fh.write(chunk)
+        _http_download(url, tmp_tar)
 
         with tarfile.open(tmp_tar, "r:gz") as tf:
             mmdb_member = next(
@@ -193,9 +275,11 @@ def _download_db(db_path, license_key, edition):
             with tf.extractfile(mmdb_member) as src, open(tmp_mmdb, "wb") as dst:
                 dst.write(src.read())
 
-        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
         os.replace(tmp_mmdb, db_path)
         logger.info("ipgeo: %s updated at %s", edition, db_path)
+
+        # --- 3. Share back to the cache so the next consumer benefits ---
+        _upload_to_cache(cache_url, upload_token, edition, db_path)
     except Exception as exc:
         logger.error("ipgeo: failed to download %s: %s", edition, exc)
     finally:

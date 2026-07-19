@@ -156,13 +156,18 @@ All settings go inside the `IPGEO` dict in `settings.py`.
 | `LOCAL_DB_LICENSE_KEY` | `None` | MaxMind license key. Required for auto-download. Set to `None` to disable auto-download and use only an existing file. Read from environment via `os.environ.get("MAXMIND_API_KEY")`. |
 | `LOCAL_DB_EDITION` | `"GeoLite2-City"` | MaxMind edition to download. Change to `"GeoLite2-Country"` for the country-only DB. |
 | `LOCAL_DB_UPDATE_DAYS` | `60` | Re-download the DB after this many days. MaxMind releases updates twice a week; 60 days is a reasonable refresh interval. |
+| `CACHE_URL` | `"https://ipaddress.world/api/geoip-cache/{edition}/"` | Public mirror checked before MaxMind. Set to `None` to disable. Avoids MaxMind's "Daily GeoIP Database Download Limit Reached" errors when many consumers run on the same MaxMind key. |
+| `CACHE_UPLOAD_TOKEN` | `None` | Token required to PUT a fresh `.mmdb` to `CACHE_URL` after a successful MaxMind download. Set to `None` to skip the upload (read-only consumer). |
 
-**Auto-download behaviour:**
+**Auto-download behaviour (cache-first):**
 
-- On Django startup (`AppConfig.ready()`), if `LOCAL_DB_PATH` doesn't exist or is older than `LOCAL_DB_UPDATE_DAYS` days, a background daemon thread downloads the DB from MaxMind.
-- The tar.gz is extracted in-memory and the `.mmdb` file is placed at `LOCAL_DB_PATH` via `os.replace()` — the swap is atomic, so no request ever reads a partial file.
-- While the first-time download is in progress (file absent), all requests fall through to the remote API fallback transparently.
-- While a refresh download is in progress (stale file present), requests continue to use the existing file until the new one lands.
+1. On Django startup (`AppConfig.ready()`), if `LOCAL_DB_PATH` doesn't exist or is older than `LOCAL_DB_UPDATE_DAYS` days, a background daemon thread runs.
+2. It first tries `CACHE_URL` (a public mirror at `ipaddress.world`). The mirror's files expire after 48 hours, so when fresh they are preferred over MaxMind.
+3. On cache miss (404 / network error / non-mmdb payload) it falls back to MaxMind using `LOCAL_DB_LICENSE_KEY`.
+4. After a successful MaxMind download the new `.mmdb` is uploaded back to the mirror (if `CACHE_UPLOAD_TOKEN` is set) so the next consumer benefits.
+5. The `.mmdb` is placed at `LOCAL_DB_PATH` via `os.replace()` — atomic, so no request ever reads a partial file.
+6. While the first-time download is in progress (file absent), requests fall through to the remote API fallback transparently.
+7. While a refresh download is in progress (stale file present), requests continue to use the existing file until the new one lands.
 
 ### Model matching settings
 
