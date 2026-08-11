@@ -325,6 +325,47 @@ def maybe_schedule_db_update():
     logger.info("ipgeo: started background DB download (thread: %s)", t.name)
 
 
+_reader_lock = threading.Lock()
+_reader = None
+_reader_stamp = None
+
+
+def _get_reader(db_path):
+    """
+    Return a shared geoip2 Reader for db_path, opening it at most once.
+
+    The mmdb is tens of megabytes; opening a Reader per request means an open()
+    plus mmap() on every hit. geoip2's Reader is thread-safe for lookups, so one
+    instance is shared across the whole process and only re-opened when the file
+    is replaced (the background updater swaps it via os.replace).
+    """
+    global _reader, _reader_stamp
+
+    stat = os.stat(db_path)
+    stamp = (stat.st_mtime_ns, stat.st_size)
+
+    reader = _reader
+    if reader is not None and _reader_stamp == stamp:
+        return reader
+
+    with _reader_lock:
+        # Re-check: another thread may have opened it while we waited.
+        if _reader is not None and _reader_stamp == stamp:
+            return _reader
+
+        import geoip2.database  # optional dependency
+
+        new_reader = geoip2.database.Reader(db_path)
+        old_reader, _reader, _reader_stamp = _reader, new_reader, stamp
+
+    if old_reader is not None:
+        try:
+            old_reader.close()
+        except Exception:
+            pass
+    return new_reader
+
+
 def _query_local_db(ip):
     """
     Query the local MaxMind .mmdb file.
@@ -337,19 +378,17 @@ def _query_local_db(ip):
         # File missing: either first-time download in progress or no DB configured.
         return None
     try:
-        import geoip2.database  # optional dependency
-        with geoip2.database.Reader(db_path) as reader:
-            resp = reader.city(ip)
-            city = resp.city.name
-            if not city:
-                return None
-            return {
-                "city": city,
-                "country": resp.country.name,
-                "country_code": resp.country.iso_code,
-                "lat": resp.location.latitude,
-                "lon": resp.location.longitude,
-            }
+        resp = _get_reader(db_path).city(ip)
+        city = resp.city.name
+        if not city:
+            return None
+        return {
+            "city": city,
+            "country": resp.country.name,
+            "country_code": resp.country.iso_code,
+            "lat": resp.location.latitude,
+            "lon": resp.location.longitude,
+        }
     except Exception as exc:
         logger.debug("ipgeo local DB failed for %s: %s", ip, exc)
         return None

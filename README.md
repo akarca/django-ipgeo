@@ -8,7 +8,10 @@ optionally matches them against your own database models.
 1. **Local MaxMind GeoLite2-City database** — instant, no network call. Auto-downloaded and refreshed in the background when missing or stale.
 2. **Remote APIs (sequential fallback)** — 5 free services tried one-by-one; stops at the first successful response. Used while the local DB is unavailable or not configured.
 
-Result is cached in the Django session — only one lookup per visitor session.
+Result is cached per IP in Django's cache framework — one lookup per address,
+shared across every visitor from it. Session storage is opt-in (`USE_SESSION`)
+and off by default: cookieless clients such as crawlers get a fresh session per
+request, so caching there writes a session row on every hit.
 
 ## Features
 
@@ -146,7 +149,12 @@ All settings go inside the `IPGEO` dict in `settings.py`.
 | Key | Default | Description |
 |-----|---------|-------------|
 | `TIMEOUT` | `2` | Seconds per remote API call |
-| `SESSION_KEY` | `"ipgeo"` | Django session key used to cache the geo result |
+| `USE_SESSION` | `False` | Also mirror the result into the session. Off by default — see the caching note above. |
+| `SESSION_KEY` | `"ipgeo"` | Session key used when `USE_SESSION` is on |
+| `CACHE_ALIAS` | `"default"` | Which entry in `CACHES` holds the per-IP results |
+| `CACHE_TIMEOUT` | `86400` | Seconds a successful lookup stays cached |
+| `CACHE_MISS_TIMEOUT` | `3600` | Seconds a failed lookup stays cached, so unresolvable IPs don't re-run the remote fallback every request |
+| `CACHE_KEY_PREFIX` | `"ipgeo:"` | Prefix for the per-IP cache keys |
 
 ### Local MaxMind DB settings
 
@@ -275,8 +283,8 @@ result = geolocate_ip("8.8.8.8")
 ## How It Works
 
 1. **IP extraction** — reads `X-Forwarded-For`, `X-Real-IP`, or `REMOTE_ADDR`
-2. **Private IP check** — skips lookups for localhost/private networks; stores `False` in session
-3. **Session cache** — if geo data is already in the session, returns immediately
+2. **Private IP check** — skips lookups for localhost/private networks
+3. **Per-IP cache** — if the IP is already in the cache, returns immediately; negative results are cached too
 4. **Local DB** — if `LOCAL_DB_PATH` exists, queries the MaxMind `.mmdb` file (no network); returns on success
 5. **Remote fallback** — queries the 5 free APIs sequentially; stops and returns on the first successful response
 6. **Auto-refresh** — at startup, if the DB file is absent or older than `LOCAL_DB_UPDATE_DAYS` days, a background thread downloads and atomically replaces it

@@ -9,8 +9,8 @@ import logging
 
 from django.apps import apps
 
+from .cache import resolve_geo
 from .conf import get_config
-from .engine import get_client_ip, geolocate_ip, is_private_ip
 
 logger = logging.getLogger(__name__)
 
@@ -51,42 +51,17 @@ def ipgeo_context(request):
     Settings via IPGEO dict in Django settings. See ipgeo.conf for defaults.
     """
     conf = get_config()
-    session_key = conf["SESSION_KEY"]
     prefix = conf["CONTEXT_PREFIX"]
 
-    # 1. Check session cache
-    geo = request.session.get(session_key)
-
-    if geo is None:
-        ip = get_client_ip(request)
-        if ip and not is_private_ip(ip):
-            geo = geolocate_ip(
-                ip,
-                timeout=conf["TIMEOUT"],
-            )
-            if geo:
-                request.session[session_key] = geo
-                logger.info(
-                    "ipgeo: %s -> %s, %s (confidence=%.0f%%, sources=%d)",
-                    ip,
-                    geo["city"],
-                    geo["country_code"],
-                    geo["confidence"] * 100,
-                    geo["sources"],
-                )
-            else:
-                request.session[session_key] = False
-                geo = False
-        else:
-            request.session[session_key] = False
-            geo = False
+    # 1. Resolve via the shared per-IP cache (see ipgeo.cache).
+    geo = resolve_geo(request)
 
     # 2. Build model-match context
     matched_city = None
     matched_country = None
     nearby_items = []
 
-    if geo and geo is not False:
+    if geo:
         CityModel = _resolve_model(conf["CITY_MODEL"])
         CountryModel = _resolve_model(conf["COUNTRY_MODEL"])
 
@@ -126,7 +101,7 @@ def ipgeo_context(request):
             nearby_items = list(qs[: conf["NEARBY_LIMIT"]])
 
     return {
-        f"{prefix}_data": geo if geo and geo is not False else None,
+        f"{prefix}_data": geo,
         f"{prefix}_city": matched_city,
         f"{prefix}_country": matched_country,
         f"{prefix}_nearby": nearby_items,

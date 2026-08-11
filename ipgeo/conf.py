@@ -4,6 +4,22 @@ _DEFAULTS = {
     # Engine settings
     "TIMEOUT": 2,
     "SESSION_KEY": "ipgeo",
+    # Where per-IP results are cached. The cache is keyed by IP, so the result
+    # is shared across every visitor from that address instead of being copied
+    # into each one's session.
+    #
+    # Session storage is opt-in and off by default: cookieless clients (every
+    # crawler) get a brand-new session per request, so writing geo data there
+    # inserts one session row per hit and will bloat the session store into
+    # millions of rows. Only enable it if you need geo pinned to a session.
+    "USE_SESSION": False,
+    "CACHE_ALIAS": "default",
+    # How long a successful lookup stays cached (seconds).
+    "CACHE_TIMEOUT": 60 * 60 * 24,
+    # How long a failed lookup stays cached (seconds). Without this, every
+    # request from an unresolvable IP re-runs the full remote-API fallback.
+    "CACHE_MISS_TIMEOUT": 60 * 60,
+    "CACHE_KEY_PREFIX": "ipgeo:",
     # Path where the local MaxMind .mmdb file lives (or will be downloaded to).
     "LOCAL_DB_PATH": None,
     # MaxMind license key — if set, the DB is downloaded automatically when

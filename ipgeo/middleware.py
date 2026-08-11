@@ -19,8 +19,7 @@ Then in views:
 
 import logging
 
-from .conf import get_config
-from .engine import get_client_ip, geolocate_ip, is_private_ip
+from .cache import resolve_geo
 
 logger = logging.getLogger(__name__)
 
@@ -32,32 +31,6 @@ class IPGeoMiddleware:
         self.get_response = get_response
 
     def __call__(self, request):
-        conf = get_config()
-        session_key = conf["SESSION_KEY"]
-
-        geo = request.session.get(session_key)
-
-        if geo is None:
-            ip = get_client_ip(request)
-            if ip and not is_private_ip(ip):
-                geo = geolocate_ip(ip, timeout=conf["TIMEOUT"])
-                if geo:
-                    request.session[session_key] = geo
-                    logger.info(
-                        "ipgeo: %s -> %s, %s (confidence=%.0f%%, sources=%d)",
-                        ip,
-                        geo["city"],
-                        geo["country_code"],
-                        geo["confidence"] * 100,
-                        geo["sources"],
-                    )
-                else:
-                    request.session[session_key] = False
-                    geo = False
-            else:
-                request.session[session_key] = False
-                geo = False
-
-        request.ipgeo = geo if geo and geo is not False else None
+        request.ipgeo = resolve_geo(request)
 
         return self.get_response(request)
