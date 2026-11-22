@@ -27,12 +27,15 @@ def _setup_django():
 _setup_django()
 
 sys.path.insert(0, "/Users/serdar/workspace/django-ipgeo")
-from ipgeo.engine import _fetch_from_cache, _download_db
+from ipgeo.engine import (
+    MMDB_METADATA_MARKER, _claim_download_slot, _download_db, _fetch_from_cache, is_mmdb,
+)
 
 
 def _mmdb_bytes():
-    # Real MaxMind mmdb files start with the binary database type marker.
-    return b"\x00\x01\x02\x03" + b"\x00" * 100
+    # Real MaxMind DBs start with the search tree (no fixed bytes) and end
+    # with a metadata section introduced by this marker.
+    return b"\x00\x00\x01\x00" + b"\x00" * 100 + MMDB_METADATA_MARKER + b"meta"
 
 
 def test_cache_hit_returns_true(tmp_path):
@@ -55,7 +58,7 @@ def test_cache_hit_returns_true(tmp_path):
     assert result is True
     assert os.path.exists(dest)
     with open(dest, "rb") as fh:
-        assert fh.read(4) == b"\x00\x01\x02\x03"
+        assert fh.read() == _mmdb_bytes()
     mock_maxmind.assert_not_called()
 
 
@@ -111,7 +114,7 @@ def test_download_db_prefers_cache_over_maxmind(tmp_path):
     mock_upload.assert_not_called()  # nothing to upload, got it from cache
     assert os.path.exists(db_path)
     with open(db_path, "rb") as fh:
-        assert fh.read(4) == b"\x00\x01\x02\x03"
+        assert fh.read() == _mmdb_bytes()
 
 
 def test_download_db_uploads_to_cache_on_maxmind_success(tmp_path):
@@ -136,6 +139,43 @@ def test_download_db_uploads_to_cache_on_maxmind_success(tmp_path):
     assert mock_http.call_count == 1  # only the MaxMind download
     mock_upload.assert_called_once()
     assert os.path.exists(db_path)
+
+
+def test_is_mmdb_rejects_old_header_only_check(tmp_path):
+    """The old 0x00010203 header check rejected every real DB; a file with
+    that header but no metadata marker is not a DB."""
+    fake = tmp_path / "fake.mmdb"
+    fake.write_bytes(b"\x00\x01\x02\x03" + b"\x00" * 100)
+    real = tmp_path / "real.mmdb"
+    real.write_bytes(_mmdb_bytes())
+    assert not is_mmdb(str(fake))
+    assert is_mmdb(str(real))
+    assert not is_mmdb(str(tmp_path / "missing.mmdb"))
+
+
+def test_claim_slot_backs_off_after_attempt(tmp_path):
+    """After one attempt, no process tries again within the retry window."""
+    db_path = str(tmp_path / "city.mmdb")
+    first = _claim_download_slot(db_path, 6)
+    assert first not in (False, None)
+    first.close()
+    assert _claim_download_slot(db_path, 6) is False
+    # Retry window over -> allowed again
+    old = os.path.getmtime(db_path + ".attempt") - 7 * 3600
+    os.utime(db_path + ".attempt", (old, old))
+    again = _claim_download_slot(db_path, 6)
+    assert again not in (False, None)
+    again.close()
+
+
+def test_claim_slot_refuses_while_other_process_holds_lock(tmp_path):
+    db_path = str(tmp_path / "city.mmdb")
+    holder = _claim_download_slot(db_path, 0)
+    assert holder not in (False, None)
+    try:
+        assert _claim_download_slot(db_path, 0) is False
+    finally:
+        holder.close()
 
 
 if __name__ == "__main__":

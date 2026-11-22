@@ -23,6 +23,11 @@ import os
 import tarfile
 import threading
 import time
+
+try:
+    import fcntl
+except ImportError:  # Windows: no cross-process lock, the attempt marker still applies
+    fcntl = None
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -165,6 +170,24 @@ _download_lock = threading.Lock()
 _download_in_progress = False
 
 
+# Every MaxMind DB ends with a metadata section that starts with this marker,
+# within the last 128 KiB of the file (MaxMind DB spec). The file's first bytes
+# are the search tree and have no fixed value.
+MMDB_METADATA_MARKER = b"\xab\xcd\xefMaxMind.com"
+
+
+def is_mmdb(path):
+    """Return True if path looks like a MaxMind DB file."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - 128 * 1024))
+            return MMDB_METADATA_MARKER in fh.read()
+    except OSError:
+        return False
+
+
 def _db_needs_update(db_path, update_days):
     """Return True if db_path doesn't exist or is older than update_days."""
     if not os.path.exists(db_path):
@@ -191,13 +214,10 @@ def _fetch_from_cache(cache_url_template, edition, dest_path):
         logger.info("ipgeo: trying cache %s", cache_url)
         tmp = dest_path + ".cache.mmdb"
         _http_download(cache_url, tmp)
-        # Sanity-check: real MaxMind mmdb starts with the binary database type
-        # marker (0x00 0x01 0x02 0x03 in big-endian). Anything else is almost
-        # certainly an HTML error page cached at the edge.
-        with open(tmp, "rb") as fh:
-            header = fh.read(4)
-        if header != b"\x00\x01\x02\x03":
-            logger.warning("ipgeo: cache returned non-mmdb payload (header=%r)", header)
+        # Anything that is not a MaxMind DB is almost certainly an HTML error
+        # page cached at the edge.
+        if not is_mmdb(tmp):
+            logger.warning("ipgeo: cache returned non-mmdb payload")
             try:
                 os.remove(tmp)
             except OSError:
@@ -238,10 +258,12 @@ def _upload_to_cache(cache_url_template, upload_token, edition, source_path):
         logger.warning("ipgeo: cache upload failed for %s: %s", edition, exc)
 
 
-def _download_db(db_path, license_key, edition):
+def _download_db(db_path, license_key, edition, lock_fh=None):
     """
     Download a MaxMind GeoLite2 .mmdb and atomically replace db_path.
-    Runs in a background thread — never raises, only logs.
+    Runs in a background thread — never raises, only logs. lock_fh, if given,
+    is the cross-process lock taken by maybe_schedule_db_update; it is
+    released when the download ends.
     """
     global _download_in_progress
     from .conf import get as get_conf
@@ -275,6 +297,8 @@ def _download_db(db_path, license_key, edition):
             with tf.extractfile(mmdb_member) as src, open(tmp_mmdb, "wb") as dst:
                 dst.write(src.read())
 
+        if not is_mmdb(tmp_mmdb):
+            raise ValueError("MaxMind archive did not contain a valid .mmdb")
         os.replace(tmp_mmdb, db_path)
         logger.info("ipgeo: %s updated at %s", edition, db_path)
 
@@ -288,8 +312,48 @@ def _download_db(db_path, license_key, edition):
                 os.remove(f)
             except OSError:
                 pass
+        if lock_fh is not None:
+            lock_fh.close()  # closing the file releases the flock
         with _download_lock:
             _download_in_progress = False
+
+
+def _claim_download_slot(db_path, retry_hours):
+    """
+    Decide, across every process sharing db_path (gunicorn workers, cron
+    manage.py runs), whether this one may download now.
+
+    Returns False to skip, otherwise the open lock file (None where no lock
+    is available). Only one process holds the lock at a time, and after an
+    attempt nobody tries again for retry_hours: without this, each process
+    start re-ran the download, so a failed one (e.g. MaxMind's HTTP 429)
+    hammered MaxMind and kept the daily limit exhausted.
+    """
+    marker = db_path + ".attempt"
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        lock_fh = open(db_path + ".lock", "a")
+    except OSError:
+        return None
+    if fcntl is not None:
+        try:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            lock_fh.close()
+            return False  # another process is downloading
+    try:
+        if retry_hours and time.time() - os.path.getmtime(marker) < retry_hours * 3600:
+            lock_fh.close()
+            return False  # attempted recently
+    except OSError:
+        pass  # no marker yet
+    try:
+        with open(marker, "w"):
+            pass
+        os.utime(marker)
+    except OSError:
+        pass
+    return lock_fh
 
 
 def maybe_schedule_db_update():
@@ -314,10 +378,16 @@ def maybe_schedule_db_update():
             return
         _download_in_progress = True
 
+    lock_fh = _claim_download_slot(db_path, get_conf("LOCAL_DB_RETRY_HOURS"))
+    if lock_fh is False:
+        with _download_lock:
+            _download_in_progress = False
+        return
+
     edition = get_conf("LOCAL_DB_EDITION")
     t = threading.Thread(
         target=_download_db,
-        args=(db_path, license_key, edition),
+        args=(db_path, license_key, edition, lock_fh),
         daemon=True,
         name="ipgeo-db-download",
     )

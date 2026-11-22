@@ -29,10 +29,13 @@ _DEFAULTS = {
     "LOCAL_DB_EDITION": "GeoLite2-City",
     # Re-download the local DB after this many days.
     "LOCAL_DB_UPDATE_DAYS": 60,
+    # After a download attempt (failed or not), no process sharing
+    # LOCAL_DB_PATH tries again for this many hours.
+    "LOCAL_DB_RETRY_HOURS": 6,
     # Public mirror URL — checked before hitting MaxMind directly. The URL is
     # templated with {edition}; default points to ipaddress.world's GeoIP
-    # cache (files there expire after 48h). Set to None to disable.
-    "CACHE_URL": "https://ipaddress.world/api/geoip-cache/{edition}/",
+    # mirror, which refreshes itself from MaxMind daily. Set to None to disable.
+    "CACHE_URL": "https://www.ipaddress.world/api/geoip-cache/{edition}/",
     # Token required to PUT a fresh .mmdb to the public cache. Set to None to
     # skip the upload step (download still works, others just won't benefit).
     "CACHE_UPLOAD_TOKEN": None,
