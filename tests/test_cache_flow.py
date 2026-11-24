@@ -29,6 +29,7 @@ _setup_django()
 sys.path.insert(0, "/Users/serdar/workspace/django-ipgeo")
 from ipgeo.engine import (
     MMDB_METADATA_MARKER, _claim_download_slot, _download_db, _fetch_from_cache, is_mmdb,
+    _mark_failed_attempt,
 )
 
 
@@ -153,12 +154,13 @@ def test_is_mmdb_rejects_old_header_only_check(tmp_path):
     assert not is_mmdb(str(tmp_path / "missing.mmdb"))
 
 
-def test_claim_slot_backs_off_after_attempt(tmp_path):
-    """After one attempt, no process tries again within the retry window."""
+def test_claim_slot_backs_off_after_failed_attempt(tmp_path):
+    """After a failed attempt, no process tries again within the retry window."""
     db_path = str(tmp_path / "city.mmdb")
     first = _claim_download_slot(db_path, 6)
     assert first not in (False, None)
     first.close()
+    _mark_failed_attempt(db_path)
     assert _claim_download_slot(db_path, 6) is False
     # Retry window over -> allowed again
     old = os.path.getmtime(db_path + ".attempt") - 7 * 3600
@@ -240,3 +242,31 @@ def test_local_db_country_only_hit(tmp_path):
         result = engine._query_local_db("1.2.3.4")
     assert result["city"] == ""
     assert result["country_code"] == "TR"
+
+
+def test_cut_off_download_leaves_no_marker(tmp_path):
+    """A download whose process died (slot claimed, never finished) does not
+    block the next process."""
+    db_path = str(tmp_path / "city.mmdb")
+    first = _claim_download_slot(db_path, 6)
+    first.close()  # process exits mid-download: lock released, nothing else
+    again = _claim_download_slot(db_path, 6)
+    assert again not in (False, None)
+    again.close()
+
+
+def test_failed_download_marks_attempt(tmp_path):
+    dest = str(tmp_path / "city.mmdb")
+    with patch("ipgeo.engine._fetch_from_cache", return_value=False):
+        _download_db(dest, None, "GeoLite2-City")
+    assert os.path.exists(dest + ".attempt")
+
+
+def test_short_lived_commands_do_not_download():
+    from ipgeo.apps import _is_short_lived_command
+
+    assert _is_short_lived_command(["manage.py", "migrate"])
+    assert _is_short_lived_command(["/root/app/manage.py", "collectstatic", "--noinput"])
+    assert not _is_short_lived_command(["manage.py", "runserver"])
+    assert not _is_short_lived_command(["/root/.pyenv/versions/app/bin/granian", "--interface", "wsgi"])
+    assert not _is_short_lived_command(["gunicorn", "app.wsgi"])

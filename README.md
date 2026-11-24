@@ -161,13 +161,13 @@ All settings go inside the `IPGEO` dict in `settings.py`.
 | `LOCAL_DB_EDITION` | `"GeoLite2-City"` | MaxMind edition to download. Change to `"GeoLite2-Country"` for the country-only DB. |
 | `LOCAL_DB_UPDATE_DAYS` | `7` | Re-download the DB after this many days. MaxMind releases updates twice a week; the mirror refreshes daily. |
 | `LOCAL_DB_CHECK_MINUTES` | `60` | How often a running process re-checks the DB's age (a `stat`, no network), so long-lived workers refresh without a restart. |
-| `LOCAL_DB_RETRY_HOURS` | `6` | After a download attempt, no process sharing `LOCAL_DB_PATH` (gunicorn workers, cron `manage.py` runs) tries again for this many hours. A file lock lets only one process download at a time. |
+| `LOCAL_DB_RETRY_HOURS` | `6` | After a failed download attempt, no process sharing `LOCAL_DB_PATH` (gunicorn workers, cron `manage.py` runs) tries again for this many hours. A file lock lets only one process download at a time. |
 | `CACHE_URL` | `"https://www.ipaddress.world/api/geoip-cache/{edition}/"` | Public mirror checked before MaxMind. Set to `None` to disable. Avoids MaxMind's "Daily GeoIP Database Download Limit Reached" errors when many consumers run on the same MaxMind key. |
 | `CACHE_UPLOAD_TOKEN` | `None` | Token required to PUT a fresh `.mmdb` to `CACHE_URL` after a successful MaxMind download. Set to `None` to skip the upload (read-only consumer). |
 
 **Auto-download behaviour (cache-first):**
 
-1. On Django startup (`AppConfig.ready()`) and then every `LOCAL_DB_CHECK_MINUTES` during lookups, if `LOCAL_DB_PATH` doesn't exist or is older than `LOCAL_DB_UPDATE_DAYS` days, a background daemon thread runs.
+1. On Django startup (`AppConfig.ready()`, web processes only: `manage.py` commands other than `runserver` exit too soon and skip it) and then every `LOCAL_DB_CHECK_MINUTES` during lookups, if `LOCAL_DB_PATH` doesn't exist or is older than `LOCAL_DB_UPDATE_DAYS` days, a background daemon thread runs.
 2. It first tries `CACHE_URL` (a public mirror at `ipaddress.world`, which downloads every edition from MaxMind once a day). The file is accepted only if it carries the MaxMind DB metadata marker.
 3. On cache miss (404 / network error / non-mmdb payload) it falls back to MaxMind using `LOCAL_DB_LICENSE_KEY`, if set; otherwise the old file is kept and the next attempt is `LOCAL_DB_RETRY_HOURS` later.
 4. After a successful MaxMind download the new `.mmdb` is uploaded back to the mirror (if `CACHE_UPLOAD_TOKEN` is set) so the next consumer benefits.

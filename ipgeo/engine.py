@@ -287,6 +287,7 @@ def _download_db(db_path, license_key, edition, lock_fh=None):
         # --- 2. MaxMind ---
         if not license_key:
             logger.warning("ipgeo: %s not on the mirror and no license key; keeping the old DB", edition)
+            _mark_failed_attempt(db_path)
             return
         url = (
             f"https://download.maxmind.com/app/geoip_download"
@@ -311,6 +312,7 @@ def _download_db(db_path, license_key, edition, lock_fh=None):
         _upload_to_cache(cache_url, upload_token, edition, db_path)
     except Exception as exc:
         logger.error("ipgeo: failed to download %s: %s", edition, exc)
+        _mark_failed_attempt(db_path)
     finally:
         for f in (tmp_tar, tmp_mmdb):
             try:
@@ -323,16 +325,33 @@ def _download_db(db_path, license_key, edition, lock_fh=None):
             _download_in_progress = False
 
 
+def _mark_failed_attempt(db_path):
+    """Hold every process off for LOCAL_DB_RETRY_HOURS after a failed download.
+
+    Written when an attempt fails, not when it starts: a download that is cut
+    off because its process exits (a short-lived manage.py command, a worker
+    restart) leaves no marker, so the next process retries instead of waiting
+    out the whole window with no DB.
+    """
+    marker = db_path + ".attempt"
+    try:
+        with open(marker, "w"):
+            pass
+        os.utime(marker)
+    except OSError:
+        pass
+
+
 def _claim_download_slot(db_path, retry_hours):
     """
     Decide, across every process sharing db_path (gunicorn workers, cron
     manage.py runs), whether this one may download now.
 
     Returns False to skip, otherwise the open lock file (None where no lock
-    is available). Only one process holds the lock at a time, and after an
-    attempt nobody tries again for retry_hours: without this, each process
-    start re-ran the download, so a failed one (e.g. MaxMind's HTTP 429)
-    hammered MaxMind and kept the daily limit exhausted.
+    is available). Only one process holds the lock at a time, and after a
+    failed attempt nobody tries again for retry_hours: without this, each
+    process start re-ran the download, so a failed one (e.g. MaxMind's HTTP
+    429) hammered MaxMind and kept the daily limit exhausted.
     """
     marker = db_path + ".attempt"
     try:
@@ -352,12 +371,6 @@ def _claim_download_slot(db_path, retry_hours):
             return False  # attempted recently
     except OSError:
         pass  # no marker yet
-    try:
-        with open(marker, "w"):
-            pass
-        os.utime(marker)
-    except OSError:
-        pass
     return lock_fh
 
 
