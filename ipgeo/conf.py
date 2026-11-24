@@ -22,13 +22,16 @@ _DEFAULTS = {
     "CACHE_KEY_PREFIX": "ipgeo:",
     # Path where the local MaxMind .mmdb file lives (or will be downloaded to).
     "LOCAL_DB_PATH": None,
-    # MaxMind license key — if set, the DB is downloaded automatically when
-    # missing or older than LOCAL_DB_UPDATE_DAYS days.
+    # MaxMind license key — fallback source when the mirror (CACHE_URL) misses.
+    # Not needed: with CACHE_URL set the DB is downloaded from the mirror alone.
     "LOCAL_DB_LICENSE_KEY": None,
     # MaxMind edition to download (default: GeoLite2-City).
     "LOCAL_DB_EDITION": "GeoLite2-City",
-    # Re-download the local DB after this many days.
-    "LOCAL_DB_UPDATE_DAYS": 60,
+    # Re-download the local DB after this many days. MaxMind publishes twice a
+    # week and the mirror follows daily.
+    "LOCAL_DB_UPDATE_DAYS": 7,
+    # How often a running process re-checks the DB's age (a stat, no network).
+    "LOCAL_DB_CHECK_MINUTES": 60,
     # After a download attempt (failed or not), no process sharing
     # LOCAL_DB_PATH tries again for this many hours.
     "LOCAL_DB_RETRY_HOURS": 6,

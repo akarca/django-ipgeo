@@ -5,15 +5,17 @@ Priority order:
   1. Local MaxMind GeoLite2 DB (if LOCAL_DB_PATH is configured) — no network call.
   2. Remote APIs queried sequentially; returns on first success.
 
-Auto-download: if LOCAL_DB_LICENSE_KEY is set and the DB file is missing or
-older than LOCAL_DB_UPDATE_DAYS days, a background thread downloads it from
-MaxMind. While the download is in progress the engine falls through to remote
-APIs transparently.
+Auto-download: if the DB file is missing or older than LOCAL_DB_UPDATE_DAYS
+days, a background thread downloads it -- checked at startup and then at most
+once per LOCAL_DB_CHECK_MINUTES in every running process, so long-lived workers
+refresh without a restart. While the download is in progress the engine falls
+through to remote APIs transparently.
 
 Cache: download first tries a public mirror (default: ipaddress.world's
 /api/geoip-cache/<edition>/) to avoid MaxMind's daily download limit. On
-cache miss it falls through to MaxMind, then re-uploads the fresh file to
-the cache so the next consumer benefits.
+cache miss it falls through to MaxMind (only when LOCAL_DB_LICENSE_KEY is set),
+then re-uploads the fresh file to the cache so the next consumer benefits.
+Without a license key the mirror is the only source.
 """
 
 import ipaddress
@@ -283,6 +285,9 @@ def _download_db(db_path, license_key, edition, lock_fh=None):
             return
 
         # --- 2. MaxMind ---
+        if not license_key:
+            logger.warning("ipgeo: %s not on the mirror and no license key; keeping the old DB", edition)
+            return
         url = (
             f"https://download.maxmind.com/app/geoip_download"
             f"?edition_id={edition}&license_key={license_key}&suffix=tar.gz"
@@ -358,15 +363,16 @@ def _claim_download_slot(db_path, retry_hours):
 
 def maybe_schedule_db_update():
     """
-    Called at app startup. If the DB is missing or stale and a license key is
-    configured, spawn a background thread to download it.
+    Called at app startup and periodically from lookups (_maybe_check_db). If
+    the DB is missing or stale and there is a source (the mirror or a license
+    key), spawn a background thread to download it.
     """
     global _download_in_progress
     from .conf import get as get_conf
 
     db_path = get_conf("LOCAL_DB_PATH")
     license_key = get_conf("LOCAL_DB_LICENSE_KEY")
-    if not db_path or not license_key:
+    if not db_path or not (license_key or get_conf("CACHE_URL")):
         return
 
     update_days = get_conf("LOCAL_DB_UPDATE_DAYS")
@@ -393,6 +399,29 @@ def maybe_schedule_db_update():
     )
     t.start()
     logger.info("ipgeo: started background DB download (thread: %s)", t.name)
+
+
+_last_check = time.monotonic()  # startup already ran maybe_schedule_db_update
+
+
+def _maybe_check_db():
+    """Re-run the staleness check at most once per LOCAL_DB_CHECK_MINUTES.
+
+    The startup check alone never refreshes a worker that runs for weeks. The
+    check is a stat(); the download itself is still limited to one process per
+    LOCAL_DB_RETRY_HOURS by _claim_download_slot.
+    """
+    global _last_check
+    from .conf import get as get_conf
+
+    now = time.monotonic()
+    if now - _last_check < get_conf("LOCAL_DB_CHECK_MINUTES") * 60:
+        return
+    _last_check = now
+    try:
+        maybe_schedule_db_update()
+    except Exception as exc:
+        logger.warning("ipgeo: DB update check failed: %s", exc)
 
 
 _reader_lock = threading.Lock()
@@ -441,19 +470,23 @@ def _query_local_db(ip):
     Query the local MaxMind .mmdb file.
     Requires: pip install geoip2
     Returns a geo dict or None (also returns None while a download is in progress).
+    An IP the DB places only at country level returns city "" (and the
+    country's coordinates): asking the remote APIs about it would spend their
+    rate limits on what is mostly the same answer.
     """
     from .conf import get as get_conf
     db_path = get_conf("LOCAL_DB_PATH")
+    if db_path:
+        _maybe_check_db()
     if not db_path or not os.path.exists(db_path):
         # File missing: either first-time download in progress or no DB configured.
         return None
     try:
         resp = _get_reader(db_path).city(ip)
-        city = resp.city.name
-        if not city:
+        if not resp.country.iso_code:
             return None
         return {
-            "city": city,
+            "city": resp.city.name or "",
             "country": resp.country.name,
             "country_code": resp.country.iso_code,
             "lat": resp.location.latitude,

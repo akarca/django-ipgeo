@@ -15,7 +15,7 @@ request, so caching there writes a session row on every hit.
 
 ## Features
 
-- Local MaxMind DB with automatic download and 60-day refresh
+- Local MaxMind DB downloaded from a public mirror (no MaxMind key needed), refreshed weekly while running
 - Remote fallback to 5 free IP geolocation APIs (no API keys needed)
 - Session caching — one lookup per visitor, zero repeat calls
 - Generic model matching — attach geo results to any Django Country/City model
@@ -94,7 +94,7 @@ IPGEO = {
 }
 ```
 
-With local MaxMind DB and auto-download:
+With local MaxMind DB and auto-download (from the ipaddress.world mirror, no key):
 
 ```python
 import os
@@ -106,20 +106,16 @@ IPGEO = {
 
     # Local MaxMind DB — recommended for production
     "LOCAL_DB_PATH": os.path.join(BASE_DIR, "geoip", "GeoLite2-City.mmdb"),
-    "LOCAL_DB_LICENSE_KEY": os.environ.get("MAXMIND_API_KEY"),
-    "LOCAL_DB_EDITION": "GeoLite2-City",
-    "LOCAL_DB_UPDATE_DAYS": 60,
+    # Optional: fallback to MaxMind when the mirror misses
+    # "LOCAL_DB_LICENSE_KEY": os.environ.get("MAXMIND_API_KEY"),
 }
 ```
 
-### 4. Add to .env
+### 4. (Optional) MaxMind license key
 
-```
-MAXMIND_API_KEY=your_license_key_here
-```
-
-Get a free license key at [maxmind.com](https://www.maxmind.com/en/geolite2/signup) —
-create an account and generate a license key for the GeoLite2 free tier.
+Only needed as a fallback when the mirror misses. Get a free key at
+[maxmind.com](https://www.maxmind.com/en/geolite2/signup) and put it in `.env` as
+`MAXMIND_API_KEY`.
 
 ### 5. Use in templates
 
@@ -160,19 +156,20 @@ All settings go inside the `IPGEO` dict in `settings.py`.
 
 | Key | Default | Description |
 |-----|---------|-------------|
-| `LOCAL_DB_PATH` | `None` | Absolute path to the `.mmdb` file. If the file doesn't exist and `LOCAL_DB_LICENSE_KEY` is set, it is downloaded automatically. |
-| `LOCAL_DB_LICENSE_KEY` | `None` | MaxMind license key. Required for auto-download. Set to `None` to disable auto-download and use only an existing file. Read from environment via `os.environ.get("MAXMIND_API_KEY")`. |
+| `LOCAL_DB_PATH` | `None` | Absolute path to the `.mmdb` file. Downloaded automatically (mirror first) when missing or stale. Lookups that the DB places only at country level return `city: ""` instead of falling through to the remote APIs. |
+| `LOCAL_DB_LICENSE_KEY` | `None` | MaxMind license key, used only when the mirror misses. Not required. To disable auto-download entirely set both this and `CACHE_URL` to `None`. |
 | `LOCAL_DB_EDITION` | `"GeoLite2-City"` | MaxMind edition to download. Change to `"GeoLite2-Country"` for the country-only DB. |
-| `LOCAL_DB_UPDATE_DAYS` | `60` | Re-download the DB after this many days. MaxMind releases updates twice a week; 60 days is a reasonable refresh interval. |
+| `LOCAL_DB_UPDATE_DAYS` | `7` | Re-download the DB after this many days. MaxMind releases updates twice a week; the mirror refreshes daily. |
+| `LOCAL_DB_CHECK_MINUTES` | `60` | How often a running process re-checks the DB's age (a `stat`, no network), so long-lived workers refresh without a restart. |
 | `LOCAL_DB_RETRY_HOURS` | `6` | After a download attempt, no process sharing `LOCAL_DB_PATH` (gunicorn workers, cron `manage.py` runs) tries again for this many hours. A file lock lets only one process download at a time. |
 | `CACHE_URL` | `"https://www.ipaddress.world/api/geoip-cache/{edition}/"` | Public mirror checked before MaxMind. Set to `None` to disable. Avoids MaxMind's "Daily GeoIP Database Download Limit Reached" errors when many consumers run on the same MaxMind key. |
 | `CACHE_UPLOAD_TOKEN` | `None` | Token required to PUT a fresh `.mmdb` to `CACHE_URL` after a successful MaxMind download. Set to `None` to skip the upload (read-only consumer). |
 
 **Auto-download behaviour (cache-first):**
 
-1. On Django startup (`AppConfig.ready()`), if `LOCAL_DB_PATH` doesn't exist or is older than `LOCAL_DB_UPDATE_DAYS` days, a background daemon thread runs.
+1. On Django startup (`AppConfig.ready()`) and then every `LOCAL_DB_CHECK_MINUTES` during lookups, if `LOCAL_DB_PATH` doesn't exist or is older than `LOCAL_DB_UPDATE_DAYS` days, a background daemon thread runs.
 2. It first tries `CACHE_URL` (a public mirror at `ipaddress.world`, which downloads every edition from MaxMind once a day). The file is accepted only if it carries the MaxMind DB metadata marker.
-3. On cache miss (404 / network error / non-mmdb payload) it falls back to MaxMind using `LOCAL_DB_LICENSE_KEY`.
+3. On cache miss (404 / network error / non-mmdb payload) it falls back to MaxMind using `LOCAL_DB_LICENSE_KEY`, if set; otherwise the old file is kept and the next attempt is `LOCAL_DB_RETRY_HOURS` later.
 4. After a successful MaxMind download the new `.mmdb` is uploaded back to the mirror (if `CACHE_UPLOAD_TOKEN` is set) so the next consumer benefits.
 5. The `.mmdb` is placed at `LOCAL_DB_PATH` via `os.replace()` — atomic, so no request ever reads a partial file.
 6. While the first-time download is in progress (file absent), requests fall through to the remote API fallback transparently.
@@ -288,7 +285,7 @@ result = geolocate_ip("8.8.8.8")
 3. **Per-IP cache** — if the IP is already in the cache, returns immediately; negative results are cached too
 4. **Local DB** — if `LOCAL_DB_PATH` exists, queries the MaxMind `.mmdb` file (no network); returns on success
 5. **Remote fallback** — queries the 5 free APIs sequentially; stops and returns on the first successful response
-6. **Auto-refresh** — at startup, if the DB file is absent or older than `LOCAL_DB_UPDATE_DAYS` days, a background thread downloads and atomically replaces it
+6. **Auto-refresh** — at startup and hourly while running, if the DB file is absent or older than `LOCAL_DB_UPDATE_DAYS` days, a background thread downloads and atomically replaces it
 
 ---
 

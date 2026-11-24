@@ -182,3 +182,61 @@ if __name__ == "__main__":
     import tempfile
     import pytest
     sys.exit(pytest.main([__file__, "-v"]))
+
+def test_download_db_mirror_only_without_license_key(tmp_path):
+    """No license key and a mirror miss: MaxMind is never called, the old DB stays."""
+    dest = str(tmp_path / "city.mmdb")
+    with open(dest, "wb") as fh:
+        fh.write(b"old")
+    with patch("ipgeo.engine._fetch_from_cache", return_value=False), \
+         patch("ipgeo.engine._http_download") as mock_download:
+        _download_db(dest, None, "GeoLite2-City")
+    mock_download.assert_not_called()
+    with open(dest, "rb") as fh:
+        assert fh.read() == b"old"
+
+
+def test_schedule_runs_without_license_key(tmp_path):
+    """CACHE_URL alone is enough to schedule a download."""
+    import ipgeo.engine as engine
+
+    dest = str(tmp_path / "city.mmdb")
+    conf = {"LOCAL_DB_PATH": dest, "LOCAL_DB_LICENSE_KEY": None,
+            "CACHE_URL": "https://cache.example.com/{edition}/"}
+    with patch.object(settings, "IPGEO", {**settings.IPGEO, **conf}), \
+         patch("ipgeo.engine.threading.Thread") as mock_thread:
+        engine.maybe_schedule_db_update()
+    mock_thread.assert_called_once()
+    engine._download_in_progress = False
+
+
+def test_periodic_check_is_rate_limited():
+    import ipgeo.engine as engine
+
+    with patch("ipgeo.engine.maybe_schedule_db_update") as mock_update:
+        engine._last_check = 0.0  # long ago
+        engine._maybe_check_db()
+        engine._maybe_check_db()  # within LOCAL_DB_CHECK_MINUTES
+    assert mock_update.call_count == 1
+
+
+def test_local_db_country_only_hit(tmp_path):
+    """An IP placed only at country level is answered locally, city ''."""
+    import ipgeo.engine as engine
+
+    dest = tmp_path / "city.mmdb"
+    dest.write_bytes(b"x")
+    resp = MagicMock()
+    resp.city.name = None
+    resp.country.name = "Turkey"
+    resp.country.iso_code = "TR"
+    resp.location.latitude = 39.0
+    resp.location.longitude = 35.0
+    reader = MagicMock()
+    reader.city.return_value = resp
+    with patch.object(settings, "IPGEO", {**settings.IPGEO, "LOCAL_DB_PATH": str(dest)}), \
+         patch("ipgeo.engine._maybe_check_db"), \
+         patch("ipgeo.engine._get_reader", return_value=reader):
+        result = engine._query_local_db("1.2.3.4")
+    assert result["city"] == ""
+    assert result["country_code"] == "TR"
